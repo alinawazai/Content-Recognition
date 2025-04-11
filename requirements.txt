@@ -1,0 +1,14 @@
+ultralytics
+opencv-python
+matplotlib
+faiss-cpu
+langchain-openai
+langchain-community
+langchain-cohere
+rank_bm25
+nltk
+Pillow
+google-genai
+nest_asyncio
+python-dotenv
+PyMuPDF
