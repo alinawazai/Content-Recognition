@@ -28,6 +28,12 @@ from langchain.retrievers.contextual_compression import ContextualCompressionRet
 from langchain_cohere import CohereRerank
 from nltk.tokenize import word_tokenize
 
+import nltk
+# Download required NLTK resource if needed.
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab')
 # Load environment variables (Gemini & OpenAI keys)
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
