@@ -1,344 +1,304 @@
-import streamlit as st
-import fitz  # PyMuPDF
-import asyncio
 import nest_asyncio
 nest_asyncio.apply()
 
+import asyncio
+import shutil
 import os
-import json
-import tempfile
+import glob
+import logging
 from io import BytesIO
+from uuid import uuid4
+from pathlib import Path
+
+import streamlit as st
+import fitz  # PyMuPDF
 from PIL import Image
-from dotenv import load_dotenv
-
-# Gemini imports (adjust for your environment)
-from google import genai
-
-# LangChain & FAISS imports
-import faiss
-from langchain.schema import Document
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.docstore.in_memory import InMemoryDocstore
-from langchain_community.vectorstores import FAISS
-
-# BM25 + Rerank
-from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers import EnsembleRetriever
-from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
-from langchain_cohere import CohereRerank
-from nltk.tokenize import word_tokenize
-
+import torch
+from ultralytics import YOLO
+from prompt import COMBINED_PROMPT, COMBINED_PROMPT2
 import nltk
-# Download required NLTK resource if needed.
-try:
-    nltk.data.find('tokenizers/punkt_tab')
-except LookupError:
-    nltk.download('punkt_tab')
-# Load environment variables (Gemini & OpenAI keys)
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+from dotenv import load_dotenv
+import json
+import time
 
+load_dotenv()
+
+# Gemini imports
+from google import genai
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-###############################################################################
-# 1. PDF -> High-DPI Images (in memory)
-###############################################################################
-def pdf_to_images(pdf_bytes, dpi=400):
-    """
-    Converts each page of the PDF (in memory) to a PIL Image at the specified DPI.
-    Returns a list of PIL Images.
-    """
-    images = []
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        for page_index in range(len(doc)):
-            page = doc[page_index]
-            pix = page.get_pixmap(dpi=dpi)
-            # Convert to PIL
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            images.append(img)
-    return images
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-###############################################################################
-# 2. Async call to Gemini
-###############################################################################
-async def analyze_image_gemini(img: Image, prompt: str):
-    """
-    Sends (img + prompt) to Gemini, returns the raw text or JSON as string.
-    """
-    # Convert PIL image to bytes
-    buffer = BytesIO()
-    img.save(buffer, format="JPEG")
-    buffer.seek(0)
+def log_message(msg):
+    st.sidebar.write(msg)
 
-    # Wrap synchronous Gemini call in asyncio.to_thread
-    response = await asyncio.to_thread(
-        client.models.generate_content,
-        model="gemini-2.0-flash",
-        contents=[img, prompt]  # or [buffer, prompt] if that works in your environment
-    )
-    return response.text
+# Session State initialization
+if "processed" not in st.session_state:
+    st.session_state.processed = False
+    st.session_state.final_json_results = []  # Store final JSON for each page
+    st.session_state.previous_pdf_uploaded = None
 
-###############################################################################
-# 3. Convert Gemini responses -> Documents
-###############################################################################
-def build_documents_from_responses(responses):
-    docs = []
-    for idx, resp_text in enumerate(responses):
-        # Strip potential code fences
-        clean_text = resp_text.strip().strip("```").strip()
+# Directory Setup
+DATABASE_DIR = "Database"
+Path(DATABASE_DIR).mkdir(parents=True, exist_ok=True)
+COMMERICIAL_DIR = Path(DATABASE_DIR, "Commercial")
+RESIDENTIAL_DIR = Path(DATABASE_DIR, "Residential")
+Path(COMMERICIAL_DIR).mkdir(parents=True, exist_ok=True)
+Path(RESIDENTIAL_DIR).mkdir(parents=True, exist_ok=True)
+
+DATA_DIR = "data"
+LOW_RES_DIR = Path(DATA_DIR, "40_dpi")
+HIGH_RES_DIR = Path(DATA_DIR, "500_dpi")
+OUTPUT_DIR = Path(DATA_DIR, "output")
+Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+
+# PDF to images conversion
+async def pdf_to_images(pdf_path, output_dir, fixed_length=1080):
+    log_message(f"Converting PDF to images at fixed length {fixed_length}px...")
+
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir)
+
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        log_message(f"Error opening PDF: {e}")
+        raise
+
+    file_paths = []
+    for i in range(len(doc)):
+        page = doc[i]
+        scale = fixed_length / page.rect.width
+        matrix = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=matrix)
+        image_filename = f"{base_name}_page_{i+1}.jpg"
+        image_path = os.path.join(output_dir, image_filename)
+        pix.save(image_path)
+        log_message(f"Saved image: {image_path}")
+        file_paths.append(image_path)
+    doc.close()
+    log_message("PDF conversion completed.")
+    return file_paths
+
+# Block detection with YOLO
+class BlockDetectionModel:
+    def __init__(self, weight, device=None):
+        self.device = "cuda" if (device is None and torch.cuda.is_available()) else "cpu"
+        self.model = YOLO(weight).to(self.device)
+        log_message(f"YOLO model loaded on {self.device}.")
+
+    async def predict_batch(self, images_dir):
+        if not os.path.exists(images_dir) or not os.listdir(images_dir):
+            raise ValueError(f"Directory {images_dir} is empty or does not exist.")
+        images = glob.glob(os.path.join(images_dir, "*.jpg"))
+        log_message(f"Found {len(images)} images for detection.")
+
+        output = {}
+        batch_size = 10
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i + batch_size]
+            log_message(f"YOLO detection on images {i+1}-{min(i+batch_size, len(images))} of {len(images)}.")
+            results = self.model(batch)
+            for result in results:
+                image_name = os.path.basename(result.path)
+                labels = result.boxes.cls.tolist()
+                boxes = result.boxes.xywh.tolist()
+                output[image_name] = [
+                    {"label": label, "bbox": box}
+                    for label, box in zip(labels, boxes)
+                ]
+        log_message("YOLO detection completed for all images.")
+        return output
+
+# Scaling bounding boxes to match high-res images
+def scale_bboxes(bbox, src_size=(662, 468), dst_size=(4000,3000)):
+    scale_x = dst_size[0] / src_size[0]
+    scale_y = scale_x
+    return bbox[0]*scale_x, bbox[1]*scale_y, bbox[2]*scale_x, bbox[3]*scale_y
+
+# Crop high-res images based on detected regions
+async def crop_and_save(detection_output, output_dir):
+    log_message("Cropping detected regions from high-res images...")
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir)
+
+    final_data = {}
+
+    async def process_image(image_name, detections):
+        image_resource_path = os.path.join(output_dir, image_name.replace(".jpg",""))
+        image_path = os.path.join(HIGH_RES_DIR, image_name)
+        if not os.path.exists(image_path):
+            log_message(f"High-res image missing: {image_path}")
+            return None
+        if not os.path.exists(image_resource_path):
+            os.makedirs(image_resource_path)
+
         try:
-            data = json.loads(clean_text)
-            content_str = json.dumps(data)
-        except json.JSONDecodeError:
-            content_str = resp_text
+            with Image.open(image_path) as image:
+                cropped_info = {}
+                for det in detections:
+                    label = det["label"]
+                    bbox = det["bbox"]
+                    label_dir = os.path.join(image_resource_path, str(label))
+                    os.makedirs(label_dir, exist_ok=True)
+                    x, y, w, h = scale_bboxes(bbox)
+                    cropped_img = image.crop((x - w/2, y - h/2, x + w/2, y + h/2))
+                    cropped_name = f"{label}_{len(os.listdir(label_dir))+1}.jpg"
+                    cropped_path = os.path.join(label_dir, cropped_name)
+                    cropped_img.save(cropped_path)
+                    cropped_info.setdefault(label, []).append(cropped_path)
+                cropped_info["Image_Path"] = image_path  # entire page
+                return image_name, cropped_info
+        except Exception as e:
+            log_message(f"Error cropping {image_name}: {e}")
+            return None
 
-        doc = Document(
-            page_content=content_str,
-            metadata={"page_number": idx + 1}
-        )
-        docs.append(doc)
-    return docs
+    tasks = []
+    for image_name, detections in detection_output.items():
+        tasks.append(process_image(image_name, detections))
 
-###############################################################################
-# 4. Build a Vector Store in memory
-###############################################################################
-def build_vector_store(docs):
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-large",
-        openai_api_key=OPENAI_API_KEY
-    )
-    example_vec = embeddings.embed_query("test")
-    dimension = len(example_vec)
+    results = await asyncio.gather(*tasks)
+    for result in results:
+        if result:
+            image_name, cropped_info = result
+            final_data[image_name] = cropped_info
+            # log_message(f"Cropped images saved for {image_name}")
+    log_message("Cropping completed for all images.")
+    return final_data
 
-    faiss_index = faiss.IndexFlatL2(dimension)
-    vectorstore = FAISS(
-        embedding_function=embeddings,
-        index=faiss_index,
-        docstore=InMemoryDocstore(),
-        index_to_docstore_id={}
-    )
-    vectorstore.add_documents(docs)
-    return vectorstore
-
-###############################################################################
-# 5. Create an Ensemble Retriever (BM25 + Vector + Re-rank)
-###############################################################################
-def create_ensemble_retriever(docs, vectorstore):
-    bm25 = BM25Retriever.from_documents(docs, k=10, preprocess_func=word_tokenize)
-    vector_retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 10}
-    )
-    ensemble = EnsembleRetriever(retrievers=[bm25, vector_retriever], weights=[0.6, 0.4])
-    compressor = CohereRerank(model="rerank-multilingual-v3.0", top_n=5)
-    final_retriever = ContextualCompressionRetriever(
-        base_compressor=compressor,
-        base_retriever=ensemble
-    )
-    return final_retriever
-
-###############################################################################
-# 6. The Streamlit App
-###############################################################################
-def main():
-    st.title("PDF + Gemini + Vector Search (Streamlit Cloud)")
-
-    # Hard-coded Gemini system prompt
-    system_prompt  = """
-        You are an advanced AI system specialized in analyzing architectural and engineering drawings in detail.
-
-        Please return a single, valid JSON object that begins with:
-        {
-        "Drawing_Type": "<floor_plan | section | elevation | detail | other>"
-        ...
-        }
-
-        Based on the recognized drawing type, fill in relevant details. If you only see partial labels or geometry, do your best to infer. If data is missing or cannot be deduced, use "N/A" or 0.
-
-        ==================================================================================
-        IF THE DRAWING IS A FLOOR PLAN:
-        ==================================================================================
-        1. "Building_Use": 
-        - "Residential", "Commercial", "Mixed-use", or "N/A" if unclear.
-        - If partial signage suggests a certain building type, use that.
-
-        2. "Space_Classification": 
-        - A list of areas categorized as:
-            - Communal (hallways, lounges, staircases, elevator lobbies)
-            - Private (bedrooms, apartments, bathrooms)
-            - Service (kitchens, utility rooms, storage)
-        - If unsure, mark "N/A". If text references or shapes suggest certain areas, name them.
-
-        3. "Number_of_Units": 
-        - Total identifiable apartments/units. 
-        - If unlabeled but repeated shapes appear, estimate.
-
-        4. "Number_of_Stairs": 
-        - Count any staircases (look for text like “Stair”, “S”, or typical stair icons).
-        - If you suspect partial stair references, try to confirm visually. If none, return 0.
-
-        5. "Number_of_Elevators": 
-        - Count any spaces that appear to be elevator shafts (icons or partial text). 
-        - If found but not labeled, guess if it looks like an elevator.
-
-        6. "Number_of_Hallways": 
-        - Corridors connecting multiple areas. If unlabeled but shape indicates a corridor, include it.
-
-        7. "Unit_Details": 
-        - A list of objects, one for each distinct unit/apartment.
-        - For each unit:
-            {
-            "Unit_Number": "If text says A-1, B-2, APT-2B, etc., use that; else 'N/A'",
-            "Unit_Area": "Try to approximate if dimension lines or a scale bar is visible, else 'N/A'",
-            "Bedrooms": "Attempt to infer from text or repeated room labels. If unknown, 0 or guess (1,2).",
-            "Bathrooms": "Similarly, attempt to identify from partial labeling or geometry. If none, 0.",
-            "Has_Living_Room": true/false if you see references or shape typical of living spaces,
-            "Has_Kitchen": true/false if you see references or shape typical of a kitchen,
-            "Has_Balcony": true/false if balcony text or shape is visible,
-            "Special_Features": ["study room", "utility room", etc., if recognized; else empty list]
-            }
-
-        8. "Stairs_Details": 
-        - A list for each staircase:
-            {
-            "Location": "e.g., near unit 1, center, corner, etc.",
-            "Purpose": "typical usage, e.g., access to upper floors or emergency exit"
-            }
-
-        9. "Elevator_Details": 
-        - A list describing each elevator:
-            {
-            "Location": "e.g., near unit 3, center of the plan",
-            "Purpose": "vertical transportation"
-            }
-
-        10. "Hallways": 
-            - A list of corridor objects:
-            {
-                "Location": "brief text (connects units 2 and 3, or center hallway)",
-                "Approx_Area": "if dimension lines exist, approximate area; else 'N/A'"
-            }
-
-        11. "Other_Common_Areas": 
-            - A list describing any additional communal spaces:
-            {
-                "Area_Name": "entrance hall, lobby, courtyard, lounge, etc.",
-                "Approx_Area": "estimate if dimension lines appear, else 'N/A'"
-            }
-
-        ==================================================================================
-        IF THE DRAWING IS A SECTION VIEW:
-        ==================================================================================
-        1. "Vertical_Information": 
-        - A list capturing visible floors, basements, or mezzanines:
-            {
-            "Floor_Label": "e.g., Basement, Ground, 1st Floor, or 'N/A' if unclear",
-            "Floor_Height": "approx or 'N/A' if unlabeled",
-            "Ceiling_Height": "approx or 'N/A' if unlabeled"
-            }
-
-        2. "Material_Details": 
-        - Summarize materials or finishes if text references (e.g., 'concrete', 'steel'), or guess from standard notation.
-
-        3. "Structural_Elements": 
-        - A list of recognized columns, beams, load-bearing walls, slabs, etc.
-
-        4. "Room_Layout": 
-        - Insights into internal partitions as shown in section (rooms, corridors, big open spaces).
-
-        5. "Other_Key_Features": 
-        - Windows, doors, ventilation shafts, plumbing lines, etc.
-
-        ==================================================================================
-        IF THE DRAWING IS AN ELEVATION OR A DETAIL:
-        ==================================================================================
-        - ELEVATION:
-        - "Facade_Elements": e.g., windows, doors, balconies, decorative features
-        - "Approx_Building_Height": e.g., "30 m" if dimension lines exist, else 'N/A'
-        - "Comments_or_Notes": Additional orientation or material info
-
-        - DETAIL:
-        - "Detail_Description": e.g., window frame detail, rebar joint, façade cross-section
-        - "Material_Notes": thickness, insulation, adhesives, finishing layers
-        - "Comments_or_Notes": Additional clarifications (fasteners, anchors, special notation)
-
-        ==================================================================================
-        GENERAL GUIDELINES:
-        ==================================================================================
-        - If the drawing does not match any known category, "Drawing_Type": "other".
-        - If data is missing or cannot be inferred, use "N/A" or 0.
-        - Return ONLY the JSON object, no code fences or commentary.
-        - The first key is "Drawing_Type" with one of: floor_plan, section, elevation, detail, other.
-        - Provide as much detail as possible, even from partial dimension lines or partial text references.
-        - Attempt to differentiate units if you suspect multiple types with different bedroom or bathroom counts.
-        """
-
-    # Step 1: PDF Upload
-    uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"])
-    if not uploaded_pdf:
-        st.info("Please upload a PDF to begin.")
-        return
-
-    # Step 2: Button to process the PDF
-    if st.button("Process PDF"):
-        with st.spinner("Reading PDF and converting to images..."):
-            pdf_bytes = uploaded_pdf.read()
-
-            # Convert PDF -> images in memory
-            images = pdf_to_images(pdf_bytes, dpi=400)
-
-        st.write(f"PDF has {len(images)} pages.")
-
-        # Asynchronously call Gemini on each page
-        async def process_pages():
-            tasks = []
-            for page_img in images:
-                tasks.append(analyze_image_gemini(page_img, system_prompt))
-            results = await asyncio.gather(*tasks)
-            return results
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+# Asynchronous Gemini API call for entire page and cropped images
+async def gemini_call_entire_and_crops(entire_path, cropped_paths, single_prompt):
+    contents = [single_prompt]
+    
+    # Process the entire page image (no resizing)
+    async def process_images(image_path):
         try:
-            responses = loop.run_until_complete(process_pages())
-        finally:
-            loop.close()
+            with Image.open(image_path) as img:
+                # No resizing, just append the full image as it is
+                return img
+        except Exception as e:
+            log_message(f"Error processing image {image_path}: {e}")
+            return None
 
-        # Turn responses into Documents
-        docs = build_documents_from_responses(responses)
-        if not docs:
-            st.warning("No text/JSON returned from Gemini.")
-            return
+    # Process entire page image
+    entire_img = await process_images(entire_path)
+    if entire_img:
+        contents.append(entire_img)
 
-        # Build in-memory vector store
-        vectorstore = build_vector_store(docs)
+    # Process cropped images concurrently (no resizing)
+    async def process_cropped_images():
+        tasks = [process_images(cpath) for cpath in cropped_paths]
+        return await asyncio.gather(*tasks)
 
-        # Build the retriever
-        retriever = create_ensemble_retriever(docs, vectorstore)
+    cropped_images = await process_cropped_images()
 
-        st.session_state["retriever"] = retriever
-        st.session_state["docs"] = docs
-        st.success("Processing complete! You can now query the results below.")
+    # Add cropped images to the contents
+    for cropped_img in cropped_images:
+        if cropped_img:
+            contents.append(cropped_img)
 
-    # Step 3: Query the results
-    if "retriever" in st.session_state and st.session_state["retriever"]:
-        query = st.text_input("Enter your query to search in the Gemini-extracted JSON:")
-        if query:
-            st.write("Searching...")
-            results = st.session_state["retriever"].invoke(query)
+    # Send to Gemini API
+    response = await asyncio.to_thread(client.models.generate_content, model="gemini-2.0-flash", contents=contents)
+    resp_text = response.text.strip()
+    if resp_text.startswith("```"):
+        resp_text = resp_text.replace("```", "").strip()
+        if resp_text.lower().startswith("json"):
+            resp_text = resp_text[4:].strip()
 
-            if results:
-                st.write(f"Found {len(results)} matching pages.")
-                for i, doc in enumerate(results):
-                    st.markdown(f"### Result {i+1} (Page {doc.metadata.get('page_number')}):")
-                    try:
-                        parsed = json.loads(doc.page_content)
-                        st.json(parsed)
-                    except:
-                        st.code(doc.page_content)
-            else:
-                st.write("No relevant results found.")
+    try:
+        return json.loads(resp_text)
+    except json.JSONDecodeError:
+        log_message(f"Error parsing Gemini response: {resp_text}")
+        return resp_text
+
+
+# Function to classify images and create folders based on JSON data
+def create_folders_and_classify(json_data, image_path):
+    building_purpose = json_data.get("Purpose_of_Building", "Other").capitalize()
+    project_title = json_data.get("Project_Title", "Unknown_Project")
+    drawing_type = json_data.get("Drawing_Type", "unknown").lower()
+
+    building_purpose_dir = os.path.join("Database", building_purpose)
+    project_title_dir = os.path.join(building_purpose_dir, project_title)
+    drawing_type_dir = os.path.join(project_title_dir, drawing_type)
+
+    os.makedirs(drawing_type_dir, exist_ok=True)
+
+    image_filename = os.path.basename(image_path)
+    new_image_path = os.path.join(drawing_type_dir, image_filename)
+
+    try:
+        shutil.copy(image_path, new_image_path)
+        log_message(f"Image {image_filename} moved to {drawing_type_dir}.")
+    except Exception as e:
+        log_message(f"Error moving image {image_filename}: {e}")
+
+    return new_image_path
+
+# Main processing pipeline
+async def main():
+    st.sidebar.title("PDF Processing")
+    st.title("PDF Analyzer v1.0")
+    uploaded_pdf = st.sidebar.file_uploader("Upload a PDF", type=["pdf"])
+
+    if uploaded_pdf:
+        if uploaded_pdf.name != st.session_state.previous_pdf_uploaded:
+            st.session_state.processed = False
+            st.session_state.final_json_results = []
+            st.session_state.previous_pdf_uploaded = uploaded_pdf.name
+
+        pdf_path = os.path.join(DATA_DIR, uploaded_pdf.name)
+        with open(pdf_path, "wb") as f:
+            f.write(uploaded_pdf.getbuffer())
+        st.sidebar.success("PDF uploaded successfully.")
+
+    if uploaded_pdf and not st.session_state.processed:
+        if st.sidebar.button("Run Processing Pipeline"):
+            # Step 1: Convert PDF to low-res & high-res images
+            low_res_list = await pdf_to_images(pdf_path, LOW_RES_DIR, fixed_length=662)
+            high_res_list = await pdf_to_images(pdf_path, HIGH_RES_DIR, fixed_length=4000)
+
+            # Step 2: YOLO detection on low-res images
+            model = BlockDetectionModel("best_small_yolo11_block_etraction.pt")
+            detection_results = await model.predict_batch(LOW_RES_DIR)
+
+            # Step 3: Crop from high-res images
+            page_crops = await crop_and_save(detection_results, OUTPUT_DIR)
+
+            # Single prompt for entire + cropped images
+            gemini_prompt = COMBINED_PROMPT2
+            final_results = []
+
+            # For each page, gather entire page + all cropped
+            for page_key, block_info in page_crops.items():
+                entire_image = block_info["Image_Path"]
+                all_crops = [path for label_id, path_list in block_info.items() if label_id != "Image_Path" for path in path_list]
+                # Asynchronous Gemini call
+                single_json = await gemini_call_entire_and_crops(entire_image, all_crops, gemini_prompt)
+                final_results.append({
+                    "page_name": entire_image,
+                    "gemini_output": single_json
+                })
+            st.session_state.final_json_results = final_results
+            st.session_state.processed = True
+            st.success("Processing complete! See results below.")
+
+    if uploaded_pdf and st.session_state.processed:
+        st.header("Final JSON Results per Page")
+        for idx, item in enumerate(st.session_state.final_json_results):
+            image_path = item['page_name']
+            json_data = item['gemini_output']
+            
+            # Classify image into folders
+            classified_image_path = create_folders_and_classify(json_data, image_path)
+            
+            # Display the classified image and JSON
+            st.image(classified_image_path, caption=f"Page {idx+1} - {json_data['Purpose_of_Building']}", use_container_width=True)
+            st.json(json_data)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
